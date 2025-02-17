@@ -23,6 +23,27 @@ def get_snowflake_session():
     """Get a Snowflake session."""
     return Session.builder.configs(SNOWFLAKE_CONFIG).create()
 
+def reset_table():
+    """Drop and recreate the ted_talks table."""
+    session = get_snowflake_session()
+    try:
+        # Drop existing table if it exists
+        session.sql("DROP TABLE IF EXISTS ted_talks").collect()
+        
+        # Create table for TED talks data with TIMESTAMP_NTZ for VIDEO_YEAR
+        session.sql("""
+            CREATE TABLE IF NOT EXISTS ted_talks (
+                VIDEO_TITLE VARCHAR(1000),
+                THUMBNAIL VARCHAR(1000),
+                VIDEO_DESCRIPTION VARCHAR(4000),
+                VIDEO_YEAR TIMESTAMP_NTZ
+            )
+        """).collect()
+        return True
+    except Exception as e:
+        st.error(f"Error resetting table: {e}")
+        return False
+
 def initialize_snowflake():
     """Initialize Snowflake resources."""
     session = get_snowflake_session()
@@ -46,13 +67,13 @@ def initialize_snowflake():
         session.sql("USE SCHEMA TED_TALKS_SCHEMA").collect()
         session.sql("USE WAREHOUSE TED_TALKS_WH").collect()
         
-        # Create table for TED talks data with actual CSV structure
+        # Create table if it doesn't exist
         session.sql("""
             CREATE TABLE IF NOT EXISTS ted_talks (
                 VIDEO_TITLE VARCHAR(1000),
                 THUMBNAIL VARCHAR(1000),
                 VIDEO_DESCRIPTION VARCHAR(4000),
-                VIDEO_YEAR INTEGER
+                VIDEO_YEAR TIMESTAMP_NTZ
             )
         """).collect()
         
@@ -99,6 +120,9 @@ def upload_csv_to_snowflake(file_path):
         # Read CSV file
         df = pd.read_csv(file_path)
         
+        # Convert Year to timestamp (set to January 1st of each year)
+        df['Year'] = pd.to_datetime(df['Year'].astype(str) + '-01-01')
+        
         # Rename columns to match Snowflake table
         df = df.rename(columns={
             'Title': 'VIDEO_TITLE',
@@ -117,7 +141,7 @@ def upload_csv_to_snowflake(file_path):
         st.error(f"Error uploading data: {e}")
         return False
 
-def semantic_search(query: str, page: int = 1):
+def semantic_search(query: str, page: int = 1, year_range: tuple = None):
     """Perform semantic search using Cortex Search Service."""
     try:
         session = get_snowflake_session()
@@ -129,19 +153,39 @@ def semantic_search(query: str, page: int = 1):
         # Calculate offset based on page number
         offset = (page - 1) * MAX_RESULTS_PER_PAGE
         
-        # Perform the search with pagination
+        # Create filter if year range is provided
+        filter_obj = None
+        if year_range:
+            min_year, max_year = year_range
+            # Convert years to YYYY-MM-DD format
+            min_date = f"{min_year:04d}-01-01"
+            max_date = f"{max_year:04d}-12-31"
+            if min_year and max_year:
+                filter_obj = {
+                    "@and": [
+                        {"@gte": {"VIDEO_YEAR": min_date}},
+                        {"@lte": {"VIDEO_YEAR": max_date}}
+                    ]
+                }
+        
+        # Perform the search with pagination and filter
         response = svc.search(
             query,
             ["VIDEO_TITLE", "VIDEO_DESCRIPTION", "THUMBNAIL", "VIDEO_YEAR"],
             limit=MAX_RESULTS_PER_PAGE,
-            offset=offset
+            offset=offset,
+            filter=filter_obj
         )
         
         # Convert results to DataFrame
         results_df = pd.DataFrame(response.results)
         
+        # Convert VIDEO_YEAR back to just the year for display
+        if not results_df.empty and 'VIDEO_YEAR' in results_df.columns:
+            results_df['VIDEO_YEAR'] = pd.to_datetime(results_df['VIDEO_YEAR']).dt.year
+        
         # Get total count for pagination
-        total_count = session.sql("SELECT COUNT(*) FROM ted_talks").collect()[0][0]
+        total_count = len(response.results)  # Using response length since filters affect total count
         
         return results_df, total_count
     except Exception as e:
@@ -149,7 +193,7 @@ def semantic_search(query: str, page: int = 1):
         return None, 0
 
 def main():
-    st.title("Video Search")
+    st.title("Test Search")
     
     # Create tabs for different functionalities
     upload_tab, search_tab = st.tabs(["Upload Data", "Search Talks"])
@@ -168,17 +212,28 @@ def main():
                     st.error("❌ Failed to initialize Snowflake resources")
                     return
         
-        # Upload data
-        if st.button("Upload TED Talks Data"):
-            with st.spinner("Uploading data to Snowflake..."):
-                csv_path = "youtube_data_TED.csv"
-                if os.path.exists(csv_path):
-                    if upload_csv_to_snowflake(csv_path):
-                        st.success("✅ Data uploaded successfully!")
+        # Add Reset Table button
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Reset Table"):
+                with st.spinner("Resetting table..."):
+                    if reset_table():
+                        st.success("✅ Table reset successfully!")
                     else:
-                        st.error("❌ Failed to upload data")
-                else:
-                    st.error("❌ CSV file not found")
+                        st.error("❌ Failed to reset table")
+        
+        with col2:
+            # Upload data
+            if st.button("Upload TED Talks Data"):
+                with st.spinner("Uploading data to Snowflake..."):
+                    csv_path = "youtube_data_TED.csv"
+                    if os.path.exists(csv_path):
+                        if upload_csv_to_snowflake(csv_path):
+                            st.success("✅ Data uploaded successfully!")
+                        else:
+                            st.error("❌ Failed to upload data")
+                    else:
+                        st.error("❌ CSV file not found")
         
         # Display table preview if data exists
         if st.button("Preview Data"):
@@ -196,9 +251,29 @@ def main():
     with search_tab:
         st.write("Search YouTube videos using natural language.")
         
-        # Search input
-        query = st.text_input("Enter your search query:", 
-                             placeholder="E.g., talks about artificial intelligence and its impact on society")
+        # Get min and max years from the database for the filter
+        session = get_snowflake_session()
+        try:
+            year_range = session.sql("SELECT YEAR(MIN(VIDEO_YEAR)), YEAR(MAX(VIDEO_YEAR)) FROM ted_talks").collect()[0]
+            min_db_year, max_db_year = year_range[0], year_range[1]
+        except:
+            min_db_year, max_db_year = 2000, 2024  # Fallback values
+        
+        # Create two columns for search and filters
+        search_col, filter_col = st.columns([2, 1])
+        
+        with search_col:
+            query = st.text_input("Enter your search query:", 
+                                placeholder="E.g., talks about artificial intelligence and its impact on society")
+        
+        with filter_col:
+            st.write("Year Filter")
+            selected_years = st.slider(
+                "Select year range",
+                min_value=int(min_db_year),
+                max_value=int(max_db_year),
+                value=(int(min_db_year), int(max_db_year))
+            )
         
         if query:
             # Initialize or get current page from session state
@@ -206,7 +281,7 @@ def main():
                 st.session_state.current_page = 1
             
             with st.spinner("Searching..."):
-                results, total_count = semantic_search(query, st.session_state.current_page)
+                results, total_count = semantic_search(query, st.session_state.current_page, selected_years)
                 
                 if results is not None and not results.empty:
                     # Generate summaries for top 3 results if on first page
