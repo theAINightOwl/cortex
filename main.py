@@ -251,6 +251,14 @@ def main():
     with search_tab:
         st.write("Search YouTube videos using natural language.")
         
+        # Initialize session state for search parameters
+        if 'search_query' not in st.session_state:
+            st.session_state.search_query = ""
+            st.session_state.current_page = 1
+            st.session_state.search_results = None
+            st.session_state.total_count = 0
+            st.session_state.selected_years = None
+        
         # Get min and max years from the database for the filter
         session = get_snowflake_session()
         try:
@@ -259,78 +267,115 @@ def main():
         except:
             min_db_year, max_db_year = 2000, 2024  # Fallback values
         
-        # Create two columns for search and filters
-        search_col, filter_col = st.columns([2, 1])
+        # Search query input
+        query = st.text_input("Enter your search query:", 
+                            placeholder="E.g., talks about artificial intelligence and its impact on society",
+                            key="query_input")
         
-        with search_col:
-            query = st.text_input("Enter your search query:", 
-                                placeholder="E.g., talks about artificial intelligence and its impact on society")
+        # Year filter in expander using fragment
+        @st.fragment
+        def year_filter():
+            with st.expander("", expanded=False):
+                st.write("Filter videos by year range:")
+                years = st.slider(
+                    "Select year range",
+                    min_value=int(min_db_year),
+                    max_value=int(max_db_year),
+                    value=(int(min_db_year), int(max_db_year)),
+                    key="year_filter"
+                )
+                st.session_state.selected_years = years
+                current_filter = f"Filtering years: {years[0]} to {years[1]}"
+                st.caption(current_filter)
         
-        with filter_col:
-            st.write("Year Filter")
-            selected_years = st.slider(
-                "Select year range",
-                min_value=int(min_db_year),
-                max_value=int(max_db_year),
-                value=(int(min_db_year), int(max_db_year))
-            )
+        # Call the fragment function
+        year_filter()
         
-        if query:
-            # Initialize or get current page from session state
-            if 'current_page' not in st.session_state:
+        # Search button
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            search_clicked = st.button("🔍 Search", type="primary", use_container_width=True)
+        
+        # Only perform search when Search button is clicked
+        if search_clicked:
+            if not query:
+                st.warning("Please enter a search query.")
+            else:
+                st.session_state.search_query = query
                 st.session_state.current_page = 1
+                with st.spinner("Searching..."):
+                    results, total_count = semantic_search(query, 1, st.session_state.selected_years)
+                    st.session_state.search_results = results
+                    st.session_state.total_count = total_count
+        
+        # Display results if we have them
+        if st.session_state.search_results is not None and not st.session_state.search_results.empty:
+            results = st.session_state.search_results
+            total_count = st.session_state.total_count
             
-            with st.spinner("Searching..."):
-                results, total_count = semantic_search(query, st.session_state.current_page, selected_years)
+            # Generate summaries for top 3 results if on first page
+            if st.session_state.current_page == 1:
+                st.markdown("### 🌟 Top 3 Talks Summary")
+                with st.spinner("Generating summaries..."):
+                    summaries = get_top_results_summary(results)
+                    if summaries:
+                        for summary in summaries:
+                            with st.container(border=True):
+                                st.markdown(f"_{summary['summary']}_")
+                st.markdown("---")
+            
+            total_pages = (total_count + MAX_RESULTS_PER_PAGE - 1) // MAX_RESULTS_PER_PAGE
+            
+            # Display pagination controls
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                st.write(f"Page {st.session_state.current_page} of {total_pages}")
                 
-                if results is not None and not results.empty:
-                    # Generate summaries for top 3 results if on first page
-                    if st.session_state.current_page == 1:
-                        st.markdown("### 🌟 Top 3 Talks Summary")
-                        with st.spinner("Generating summaries..."):
-                            summaries = get_top_results_summary(results)
-                            if summaries:
-                                for summary in summaries:
-                                    with st.container(border=True):
-                                        st.markdown(f"_{summary['summary']}_")
-                        st.markdown("---")
-                    
-                    total_pages = (total_count + MAX_RESULTS_PER_PAGE - 1) // MAX_RESULTS_PER_PAGE
-                    
-                    # Display pagination controls
-                    col1, col2, col3 = st.columns([1, 2, 1])
+                # Pagination buttons
+                prev, next = st.columns(2)
+                with prev:
+                    if st.session_state.current_page > 1:
+                        if st.button("← Previous"):
+                            st.session_state.current_page -= 1
+                            with st.spinner("Updating results..."):
+                                results, total_count = semantic_search(
+                                    st.session_state.search_query, 
+                                    st.session_state.current_page, 
+                                    st.session_state.selected_years
+                                )
+                                st.session_state.search_results = results
+                                st.session_state.total_count = total_count
+                            st.rerun()
+                with next:
+                    if st.session_state.current_page < total_pages:
+                        if st.button("Next →"):
+                            st.session_state.current_page += 1
+                            with st.spinner("Updating results..."):
+                                results, total_count = semantic_search(
+                                    st.session_state.search_query, 
+                                    st.session_state.current_page, 
+                                    st.session_state.selected_years
+                                )
+                                st.session_state.search_results = results
+                                st.session_state.total_count = total_count
+                            st.rerun()
+            
+            st.success(f"Showing results {((st.session_state.current_page-1)*MAX_RESULTS_PER_PAGE)+1} to {min(st.session_state.current_page*MAX_RESULTS_PER_PAGE, total_count)} of {total_count} talks")
+            
+            # Display results in a nice format
+            for _, row in results.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"### {row['VIDEO_TITLE']}")
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        st.write("**Description:**")
+                        st.write(row['VIDEO_DESCRIPTION'][:300] + "..." if len(row['VIDEO_DESCRIPTION']) > 300 else row['VIDEO_DESCRIPTION'])
                     with col2:
-                        st.write(f"Page {st.session_state.current_page} of {total_pages}")
-                        
-                        # Pagination buttons
-                        prev, next = st.columns(2)
-                        with prev:
-                            if st.session_state.current_page > 1:
-                                if st.button("← Previous"):
-                                    st.session_state.current_page -= 1
-                                    st.rerun()
-                        with next:
-                            if st.session_state.current_page < total_pages:
-                                if st.button("Next →"):
-                                    st.session_state.current_page += 1
-                                    st.rerun()
-                    
-                    st.success(f"Showing results {((st.session_state.current_page-1)*MAX_RESULTS_PER_PAGE)+1} to {min(st.session_state.current_page*MAX_RESULTS_PER_PAGE, total_count)} of {total_count} talks")
-                    
-                    # Display results in a nice format
-                    for _, row in results.iterrows():
-                        with st.container(border=True):
-                            st.markdown(f"### {row['VIDEO_TITLE']}")
-                            col1, col2 = st.columns([2, 1])
-                            with col1:
-                                st.write("**Description:**")
-                                st.write(row['VIDEO_DESCRIPTION'][:300] + "..." if len(row['VIDEO_DESCRIPTION']) > 300 else row['VIDEO_DESCRIPTION'])
-                            with col2:
-                                st.write(f"**Year:** {row['VIDEO_YEAR']}")
-                                if row['THUMBNAIL']:
-                                    st.image(row['THUMBNAIL'], use_container_width=True)
-                else:
-                    st.warning("No results found.")
+                        st.write(f"**Year:** {row['VIDEO_YEAR']}")
+                        if row['THUMBNAIL']:
+                            st.image(row['THUMBNAIL'], use_container_width=True)
+        elif st.session_state.search_results is not None:
+            st.warning("No results found.")
 
 if __name__ == "__main__":
     main() 
